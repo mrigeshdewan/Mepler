@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Delhi NCR Ambulance Dashboard</title>
+    
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+    
+    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.0/papaparse.min.js"></script>
+    
+    <style>
+        body { margin: 0; padding: 0; font-family: Arial, sans-serif; }
+        #map { position: absolute; top: 0; bottom: 0; right: 0; left: 300px; }
+        #sidebar { position: absolute; top: 0; bottom: 0; left: 0; width: 300px; background: #f8f9fa; padding: 20px; overflow-y: auto; border-right: 1px solid #ddd; box-sizing: border-box; }
+        h3 { margin-top: 0; color: #333; }
+        
+        .filter-group { margin-bottom: 25px; background: #fff; padding: 10px; border-radius: 5px; border: 1px solid #eee; }
+        .filter-group label { display: block; margin-bottom: 8px; cursor: pointer; font-size: 14px; }
+        .filter-header { font-weight: bold; margin-bottom: 10px; font-size: 14px; text-transform: uppercase; color: #555; }
+        
+        .legend-color { width: 12px; height: 12px; border-radius: 50%; display: inline-block; margin-right: 8px; }
+        
+        #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 20px; border: 1px solid #ccc; z-index: 9999; border-radius: 5px; box-shadow: 0 0 10px rgba(0,0,0,0.2); }
+        #count-display { font-weight: bold; color: #333; }
+    </style>
+</head>
+<body>
+
+<div id="loading">Loading Data... Please wait.</div>
+
+<div id="sidebar">
+    <h3>Ambulance Dashboard</h3>
+    
+    <div class="filter-group">
+        <div class="filter-header">Promised TAT</div>
+        <label><input type="checkbox" name="tat" value="<8" checked> &lt; 8 mins</label>
+        <label><input type="checkbox" name="tat" value="8-12" checked> 8-12 mins</label>
+        <label><input type="checkbox" name="tat" value="12-15" checked> 12-15 mins</label>
+        <label><input type="checkbox" name="tat" value="15-20" checked> 15-20 mins</label>
+        <label><input type="checkbox" name="tat" value="20+" checked> 20+ mins</label>
+    </div>
+
+    <div class="filter-group">
+        <div class="filter-header">Case Type</div>
+        <label><input type="checkbox" name="type" value="emergency" checked> <span class="legend-color" style="background: #d62728;"></span> Emergency</label>
+        <label><input type="checkbox" name="type" value="opd" checked> <span class="legend-color" style="background: #1f77b4;"></span> OPD</label>
+        <label><input type="checkbox" name="type" value="hospital_transfer" checked> <span class="legend-color" style="background: #2ca02c;"></span> Hospital Transfer</label>
+        <label><input type="checkbox" name="type" value="other" checked> <span class="legend-color" style="background: #7f7f7f;"></span> Other</label>
+    </div>
+
+    <div class="filter-group">
+        <div class="filter-header">Date Range</div>
+        <label><input type="radio" name="date" value="all" checked> All Time</label>
+        <label><input type="radio" name="date" value="3m"> Last 3 Months</label>
+        <label><input type="radio" name="date" value="1m"> Last 1 Month</label>
+    </div>
+
+    <div class="filter-group">
+        <div class="filter-header">Time of Day</div>
+        <label><input type="checkbox" name="time" value="09:00-18:00" checked> 9 AM - 6 PM</label>
+        <label><input type="checkbox" name="time" value="18:00-09:00" checked> 6 PM - 9 AM</label>
+    </div>
+
+    <div class="filter-group">
+        <div class="filter-header">Summary</div>
+        <div id="count-display">Initializing...</div>
+    </div>
+</div>
+
+<div id="map"></div>
+
+<script>
+    // --- Configuration ---
+    // Ensure these match your actual uploaded filenames
+    const FILES = {
+        cases: 'cases.csv',
+        depots: 'depots.csv',
+        polygons: 'polygons.kml'
+    };
+
+    // --- State ---
+    let map;
+    let layers = {
+        cases: null,
+        polygons: null,
+        depots: null
+    };
+    let data = {
+        cases: [],
+        maxDate: null
+    };
+
+    // --- Initialization ---
+    document.addEventListener('DOMContentLoaded', () => {
+        initMap();
+        loadData();
+    });
+
+    function initMap() {
+        // Center on Delhi NCR
+        map = L.map('map').setView([28.55, 77.10], 10);
+        
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+            attribution: 'Map data &copy; <a href="https://www.openstreetmap.org/">OpenStreetMap</a> contributors',
+            subdomains: 'abcd',
+            maxZoom: 19
+        }).addTo(map);
+
+        layers.cases = L.layerGroup().addTo(map);
+    }
+
+    // --- Data Loading ---
+    async function loadData() {
+        try {
+            const [casesRes, depotsRes, polygonsRes] = await Promise.all([
+                fetch(FILES.cases).then(r => r.ok ? r.text() : Promise.reject('Cases CSV not found')),
+                fetch(FILES.depots).then(r => r.ok ? r.text() : Promise.reject('Depots CSV not found')),
+                fetch(FILES.polygons).then(r => r.ok ? r.text() : Promise.reject('Polygons KML not found'))
+            ]);
+
+            processCases(casesRes);
+            processDepots(depotsRes);
+            processPolygons(polygonsRes);
+
+            document.getElementById('loading').style.display = 'none';
+            updateDashboard(); // Initial Render
+            
+            // Attach Event Listeners
+            document.querySelectorAll('input').forEach(el => el.addEventListener('change', updateDashboard));
+
+        } catch (error) {
+            document.getElementById('loading').innerText = 'Error loading data: ' + error + '. Ensure files are named correctly and hosted via a server (e.g., GitHub Pages).';
+            console.error(error);
+        }
+    }
+
+    // --- Processing ---
+    function processCases(csvText) {
+        const parsed = Papa.parse(csvText, { header: true, dynamicTyping: true, skipEmptyLines: true });
+        
+        // Find Max Date for relative filtering
+        let maxTs = 0;
+
+        data.cases = parsed.data.map(row => {
+            // Validate required fields
+            if (!row['Pick up lat'] || !row['Pick up long']) return null;
+
+            // Date Parsing
+            const dateStr = row['order_request_time']; // "2025-02-17 14:29:41"
+            const dateObj = new Date(dateStr);
+            if (dateObj.getTime() > maxTs) maxTs = dateObj.getTime();
+
+            // Category Mapping
+            let catRaw = (row['category_of_case'] || '').toString().toLowerCase();
+            let cat = 'other';
+            if (catRaw.includes('emergency')) cat = 'emergency';
+            else if (catRaw.includes('opd')) cat = 'opd';
+            else if (catRaw.includes('hospital')) cat = 'hospital_transfer';
+
+            // TAT Binning
+            let tat = row['promised_tat'];
+            let tatRange = '20+';
+            if (tat < 8) tatRange = '<8';
+            else if (tat < 12) tatRange = '8-12';
+            else if (tat < 15) tatRange = '12-15';
+            else if (tat < 20) tatRange = '15-20';
+
+            // Time Slot
+            const hour = dateObj.getHours();
+            const timeSlot = (hour >= 9 && hour < 18) ? '09:00-18:00' : '18:00-09:00';
+
+            return {
+                lat: row['Pick up lat'],
+                lng: row['Pick up long'],
+                cat: cat,
+                tat: tat,
+                tatRange: tatRange,
+                date: dateObj,
+                timeSlot: timeSlot,
+                info: `<b>ID:</b> ${row['customer_id']}<br><b>Type:</b> ${row['category_of_case']}<br><b>TAT:</b> ${tat} min<br><b>Time:</b> ${dateStr}`
+            };
+        }).filter(item => item !== null);
+
+        data.maxDate = new Date(maxTs);
+        console.log(`Loaded ${data.cases.length} cases. Max Date: ${data.maxDate}`);
+    }
+
+    function processDepots(csvText) {
+        const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: true });
+        
+        const depotIcon = L.icon({
+            iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/markers/marker-icon-2x-black.png',
+            shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/0.7.7/images/marker-shadow.png',
+            iconSize: [25, 41],
+            iconAnchor: [12, 41],
+            popupAnchor: [1, -34],
+            shadowSize: [41, 41]
+        });
+
+        parsed.data.forEach(row => {
+            const rawLatLong = row['Lat Longs'];
+            if (!rawLatLong) return;
+            
+            const parts = rawLatLong.split(',');
+            if (parts.length < 2) return;
+            
+            const lat = parseFloat(parts[0].trim());
+            const lng = parseFloat(parts[1].trim());
+
+            L.marker([lat, lng], {icon: depotIcon})
+             .bindPopup(`<b>${row['Name']}</b><br>${row['Model']}`)
+             .addTo(map);
+        });
+    }
+
+    function processPolygons(kmlText) {
+        const parser = new DOMParser();
+        const kml = parser.parseFromString(kmlText, 'text/xml');
+        const placemarks = kml.getElementsByTagName('Placemark');
+
+        for (let i = 0; i < placemarks.length; i++) {
+            const pm = placemarks[i];
+            const name = pm.getElementsByTagName('name')[0]?.textContent || 'Zone';
+            const polygons = pm.getElementsByTagName('Polygon');
+
+            for (let j = 0; j < polygons.length; j++) {
+                const coordsText = polygons[j].getElementsByTagName('coordinates')[0]?.textContent;
+                if (!coordsText) continue;
+
+                // KML is Lng,Lat,Alt. Leaflet needs Lat,Lng.
+                const latLngs = coordsText.trim().split(/\s+/).map(pair => {
+                    const parts = pair.split(',');
+                    if (parts.length >= 2) {
+                        return [parseFloat(parts[1]), parseFloat(parts[0])]; // Swap to [Lat, Lng]
+                    }
+                    return null;
+                }).filter(x => x);
+
+                if (latLngs.length > 0) {
+                    L.polygon(latLngs, {
+                        color: 'blue',
+                        weight: 1,
+                        fillOpacity: 0.1
+                    }).bindPopup(name).addTo(map);
+                }
+            }
+        }
+    }
+
+    // --- Dashboard Logic ---
+    function updateDashboard() {
+        layers.cases.clearLayers();
+
+        // Get Filter Values
+        const filters = {
+            tat: Array.from(document.querySelectorAll('input[name="tat"]:checked')).map(cb => cb.value),
+            type: Array.from(document.querySelectorAll('input[name="type"]:checked')).map(cb => cb.value),
+            time: Array.from(document.querySelectorAll('input[name="time"]:checked')).map(cb => cb.value),
+            date: document.querySelector('input[name="date"]:checked').value
+        };
+
+        // Date Threshold Calculation
+        let dateLimit = new Date(data.maxDate); // Copy
+        if (filters.date === '1m') {
+            dateLimit.setDate(dateLimit.getDate() - 30);
+        } else if (filters.date === '3m') {
+            dateLimit.setDate(dateLimit.getDate() - 90);
+        } else {
+            dateLimit = new Date(0); // All time (1970)
+        }
+
+        let count = 0;
+
+        data.cases.forEach(c => {
+            // Apply Filters
+            if (!filters.tat.includes(c.tatRange)) return;
+            if (!filters.type.includes(c.cat)) return;
+            if (!filters.time.includes(c.timeSlot)) return;
+            if (c.date < dateLimit) return;
+
+            // Determine Color
+            let color = '#7f7f7f'; // other
+            if (c.cat === 'emergency') color = '#d62728';
+            else if (c.cat === 'opd') color = '#1f77b4';
+            else if (c.cat === 'hospital_transfer') color = '#2ca02c';
+
+            L.circleMarker([c.lat, c.lng], {
+                radius: 5,
+                fillColor: color,
+                color: '#fff',
+                weight: 1,
+                opacity: 1,
+                fillOpacity: 0.8
+            }).bindPopup(c.info).addTo(layers.cases);
+
+            count++;
+        });
+
+        document.getElementById('count-display').innerText = `Showing ${count} cases`;
+    }
+</script>
+
+</body>
+</html>
